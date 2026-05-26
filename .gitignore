@@ -16,6 +16,7 @@ flush-context-*.md
 .claude/
 memory/
 MEMORY.md
+CLAUDE.md
 wiki_*.md
 *.claude.json
 
