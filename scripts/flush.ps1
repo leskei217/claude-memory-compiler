@@ -14,7 +14,9 @@
 
 param(
     [Parameter(Mandatory)][string]$ContextFile,
-    [Parameter(Mandatory)][string]$SessionId
+    [Parameter(Mandatory)][string]$SessionId,
+    [string]$SourceProject = "",
+    [string]$Cwd = ""
 )
 
 # Recursion guard: prevent hooks from re-firing if this process somehow
@@ -43,7 +45,13 @@ function Append-DailyLog([string]$Content, [string]$Section = "Session") {
     }
 
     $timeStr = (Get-Date).ToString("HH:mm")
-    $entry   = "### $Section ($timeStr)`n`n$Content`n`n"
+    # Provenance line: which project this session came from (for scope routing).
+    # ${SourceProject}/${Cwd} are brace-delimited so a trailing "_" isn't parsed into the name.
+    $prov = ""
+    if ($SourceProject) {
+        $prov = if ($Cwd) { "_Проект: ${SourceProject} — ${Cwd}_`n`n" } else { "_Проект: ${SourceProject}_`n`n" }
+    }
+    $entry   = "### $Section ($timeStr)`n`n$prov$Content`n`n"
     [System.IO.File]::AppendAllText($logPath, $entry, [System.Text.Encoding]::UTF8)
 }
 

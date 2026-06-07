@@ -5,7 +5,8 @@
 function Invoke-ClaudeCLI {
     param(
         [Parameter(Mandatory)]
-        [string]$Prompt
+        [string]$Prompt,
+        [int]$MaxRetries = 4
     )
 
     $cliArgs = @("-p", "--output-format", "text")
@@ -14,16 +15,22 @@ function Invoke-ClaudeCLI {
         $cliArgs += $DEFAULT_MODEL
     }
 
-    $prevEncoding = [Console]::OutputEncoding
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    $output = $Prompt | & claude @cliArgs 2>$null
-    [Console]::OutputEncoding = $prevEncoding
+    for ($attempt = 1; ; $attempt++) {
+        $prevEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        $output = $Prompt | & claude @cliArgs 2>$null
+        $exit   = $LASTEXITCODE
+        [Console]::OutputEncoding = $prevEncoding
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "claude CLI exited with code $LASTEXITCODE. Verify that 'claude' is in PATH and authenticated (run: claude auth login)."
+        if ($exit -eq 0) {
+            return ($output -is [array]) ? ($output -join "`n") : [string]$output
+        }
+        if ($attempt -ge $MaxRetries) {
+            throw "claude CLI exited with code $exit after $attempt attempt(s). Verify that 'claude' is in PATH and authenticated (run: claude auth login)."
+        }
+        # Backoff for transient / rate-limit failures, then retry.
+        Start-Sleep -Seconds ([Math]::Min(30, 5 * $attempt))
     }
-
-    return ($output -is [array]) ? ($output -join "`n") : [string]$output
 }
 
 # Parses structured file-operation blocks from compile/query output.
@@ -105,4 +112,37 @@ function Invoke-FileTool {
         }
         default { return "Unknown tool: $ToolName" }
     }
+}
+
+# Classify an article body into knowledge DOMAINS, picking ONLY from the controlled
+# vocabulary (domains.md). Returns a (possibly empty) array of vocab keys. The vocab
+# filter is deterministic — anything the LLM returns outside the vocabulary is dropped.
+# Shared by compile/tag-domains (live tagging) and suggest-domains (offline batch) so
+# the classifier prompt never drifts between them.
+function Get-DomainsForArticle {
+    param(
+        [Parameter(Mandatory)] [string]$Body,
+        [Parameter(Mandatory)] [string[]]$Vocab
+    )
+    if (-not $Vocab -or $Vocab.Count -eq 0) { return @() }
+
+    $prompt = @"
+Ты классификатор доменов знаний. Ниже статья. Выбери ВСЕ подходящие домены ТОЛЬКО из этого списка:
+$($Vocab -join ', ')
+
+Домен подходит, если знание статьи относится к этой области. Выбери 1–3 самых релевантных.
+Если ни один не подходит — ответь ровно: -
+Ответь ОДНОЙ строкой: ключи доменов через запятую, без пояснений и без markdown.
+
+## Статья
+$Body
+"@
+    $resp = Invoke-ClaudeCLI -Prompt $prompt   # throws on persistent CLI failure — caller logs it
+
+    $picked = @()
+    foreach ($tok in ($resp -split '[,;\r\n]+')) {
+        $t = $tok.Trim().Trim('`', '"', "'", ' ').ToLower()
+        if ($t -and ($t -in $Vocab) -and ($t -notin $picked)) { $picked += $t }
+    }
+    return @($picked)
 }

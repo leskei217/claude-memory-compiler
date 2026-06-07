@@ -1,20 +1,33 @@
 #Requires -Version 7
 <#
 .SYNOPSIS
-    SessionStart hook — injects knowledge base context into every new session.
-    Reads from the configured brain directory. No API calls.
+    SessionStart hook — injects project-filtered knowledge base context into a new
+    session. Reads cwd from the hook stdin, then injects only global articles plus
+    articles whose source_project matches the current project. No API calls.
 #>
 
-$REPO_DIR      = Split-Path $PSScriptRoot -Parent
-$brainFile     = Join-Path $REPO_DIR "brain.path"
-$BRAIN_DIR     = if (Test-Path $brainFile) { (Get-Content $brainFile -Raw -Encoding UTF8).Trim() } else { $REPO_DIR }
-$CLAUDE_DIR    = Join-Path $BRAIN_DIR ".claude"
-$KNOWLEDGE_DIR = Join-Path $CLAUDE_DIR "knowledge"
-$DAILY_DIR     = Join-Path $CLAUDE_DIR "daily"
-$INDEX_FILE    = Join-Path $KNOWLEDGE_DIR "index.md"
+# Cyrillic in additionalContext must reach Claude Code as UTF-8, not OEM mojibake.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {}
+
+$REPO_DIR = Split-Path $PSScriptRoot -Parent
+. (Join-Path $REPO_DIR "scripts\_config.ps1")   # paths + Get-ProjectKey
 
 $MAX_CONTEXT_CHARS = 20000
 $MAX_LOG_LINES     = 30
+
+# --- Current project from hook stdin (cwd) ---
+$projKey = ""
+try {
+    $rawIn = [Console]::In.ReadToEnd()
+    if ($rawIn) {
+        $rawIn     = $rawIn -replace '(?<!\\)\\(?!["\\/bfnrtu])', '\\\\'
+        $hookInput = $rawIn | ConvertFrom-Json
+        if ($hookInput.cwd) { $projKey = Get-ProjectKey $hookInput.cwd }
+    }
+} catch { $projKey = "" }
 
 function Get-RecentLog {
     for ($offset = 0; $offset -le 1; $offset++) {
@@ -29,14 +42,33 @@ function Get-RecentLog {
     return "(no recent daily log)"
 }
 
+# Keep only rows where Scope == global (or blank legacy) OR Project == current project.
+# Rules (type == rule) are surfaced first. Uses the shared parser/predicate in _config
+# so the injected set always matches what /brain reports.
+function Get-FilteredIndex([string]$ProjKey) {
+    $rows = Get-IndexRows
+    if ($rows.Count -eq 0) { return "(empty — no articles compiled yet)" }
+    # Real header+separator from the index file → never drifts from reindex columns.
+    $tableLines = @(Get-Content $INDEX_FILE -Encoding UTF8 | Where-Object { $_ -match '^\s*\|' })
+    $header = (@($tableLines | Select-Object -First 2)) -join "`n"
+    $kept   = @($rows | Where-Object { Test-RowInjected $_ $ProjKey })
+    $rules  = @($kept | Where-Object { $_.type -eq 'rule' })
+    $others = @($kept | Where-Object { $_.type -ne 'rule' })
+    return "$header`n" + ((@($rules) + @($others) | ForEach-Object { $_.raw }) -join "`n")
+}
+
 $parts = [System.Collections.Generic.List[string]]::new()
 $parts.Add("## Today`n$((Get-Date).ToString('dddd, MMMM dd, yyyy'))")
 
-if (Test-Path $INDEX_FILE) {
-    $parts.Add("## Knowledge Base Index`n`n$(Get-Content $INDEX_FILE -Raw -Encoding UTF8)")
+$indexBlock = if (-not (Test-Path $INDEX_FILE)) {
+    "(empty — no articles compiled yet)"
+} elseif ($projKey) {
+    Get-FilteredIndex $projKey            # filter by current project
 } else {
-    $parts.Add("## Knowledge Base Index`n`n(empty — no articles compiled yet)")
+    Get-Content $INDEX_FILE -Raw -Encoding UTF8   # no cwd → inject everything (no regression)
 }
+$projNote = if ($projKey) { " (проект: $projKey)" } else { "" }
+$parts.Add("## Knowledge Base Index$projNote`n`n$indexBlock")
 
 $parts.Add("## Recent Daily Log`n`n$(Get-RecentLog)")
 

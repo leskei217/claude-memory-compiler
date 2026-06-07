@@ -82,15 +82,21 @@ $logContent
 <<<END>>>
 
 ## Правила
-1. Извлеки 3-7 отдельных концептов как статьи в knowledge/concepts/
-2. Создай статьи связей в knowledge/connections/ для неочевидных взаимосвязей
-3. Обнови или создай knowledge/index.md с новыми строками статей
-4. Добавь запись о сборке в knowledge/log.md:
+1. Извлеки 3-7 отдельных уроков как статьи в knowledge/concepts/.
+2. У КАЖДОГО концепта во frontmatter обязательны (см. схему выше):
+   - type: concept | rule — rule для императивного урока «делай / не-делай / подвох» (грабли, анти-паттерн); concept для энциклопедической статьи.
+   - scope: global | project — global, если урок полезен в ЛЮБОМ проекте (инструмент/язык/OS); project только для явных локальных фактов (схемы, поля, ключи API, бизнес-логика). СМЕЩЕНИЕ В GLOBAL: при сомнении выбирай global.
+   - source_project: имя проекта из строки "_Проект:_" сессии-источника; unknown, если не определимо; при нескольких источниках — через запятую.
+   - summary: однострочное описание для индекса.
+   - а также title, sources, created, updated.
+3. Создай статьи связей в knowledge/connections/ для неочевидных взаимосвязей (по умолчанию scope: global).
+4. НЕ трогай knowledge/index.md — его детерминированно пересоберёт reindex.ps1.
+5. Добавь запись о сборке в knowledge/log.md:
    ## [$timestamp] compile | $(Split-Path $LogPath -Leaf)
-5. Предпочитай обновлять существующие статьи, а не создавать почти-дубликаты
-6. Каждая статья должна иметь YAML frontmatter и [[wikilinks]]
-7. Используй относительные пути от корня проекта (например, knowledge/concepts/topic.md)
-8. Заголовки разделов в статьях — на русском (## Ключевые моменты, ## Детали, ## Связанные концепты, ## Источники)
+6. Предпочитай обновлять существующие статьи, а не создавать почти-дубликаты.
+7. Каждая статья должна иметь YAML frontmatter и [[wikilinks]].
+8. Используй относительные пути от корня проекта (например, knowledge/concepts/topic.md).
+9. Заголовки разделов в статьях — на русском (## Ключевые моменты, ## Детали, ## Связанные концепты, ## Источники).
 "@
 
     Write-Host "  Calling claude CLI..."
@@ -154,6 +160,23 @@ foreach ($logPath in @($toCompile)) {
     catch {
         Write-Host "  ERROR: $_"
     }
+}
+
+# Tag domains on the freshly compiled articles — the live domain step (controlled
+# vocabulary, written straight to frontmatter; no manual Excel pass). Only articles
+# without domains yet are classified, so repeat runs are cheap.
+$tagDomainsPs = Join-Path $SCRIPTS_DIR "tag-domains.ps1"
+if (Test-Path $tagDomainsPs) {
+    Write-Host "`nTagging domains..."
+    try { & $tagDomainsPs } catch { Write-Host "  WARNING: tag-domains.ps1 failed: $_" }
+}
+
+# Rebuild the index deterministically from article frontmatter (session-start
+# filtering depends on accurate Scope/Project columns).
+$reindexPs = Join-Path $SCRIPTS_DIR "reindex.ps1"
+if (Test-Path $reindexPs) {
+    Write-Host "`nRebuilding index..."
+    try { & $reindexPs } catch { Write-Host "  WARNING: reindex.ps1 failed — index may be stale: $_" }
 }
 
 $articles = @()

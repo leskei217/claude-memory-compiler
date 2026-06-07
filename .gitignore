@@ -17,7 +17,6 @@ flush-context-*.md
 memory/
 MEMORY.md
 CLAUDE.md
-wiki_*.md
 *.claude.json
 
 # Editor folders
@@ -33,3 +32,8 @@ $RECYCLE.BIN/
 *.tmp
 *.temp
 *.log
+claude-ai/
+
+# Python (review tooling: build/read-review-xlsx.py)
+__pycache__/
+*.pyc

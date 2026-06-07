@@ -2,8 +2,8 @@
 <#
 .SYNOPSIS
     Lint the knowledge base for structural and semantic health.
-    Runs 7 checks: broken links, orphan pages, orphan sources, stale articles,
-    missing backlinks, sparse articles, and LLM contradiction detection.
+    Runs 8 checks: broken links, orphan pages, orphan sources, stale articles,
+    missing backlinks, sparse articles, scope audit, and LLM contradiction detection.
 
 .EXAMPLE
     pwsh -File lint.ps1                     # all checks
@@ -131,16 +131,63 @@ function Check-SparseArticles {
     $issues = @()
     foreach ($article in Get-AllArticles) {
         $content = Get-Content $article.FullName -Raw -Encoding UTF8
-        # Strip YAML frontmatter
+        # Strip YAML frontmatter at line boundaries (a `---` inside a value must not end it)
+        $body = $content
         if ($content.StartsWith("---")) {
-            $end = $content.IndexOf("---", 3)
-            if ($end -gt 0) { $content = $content.Substring($end + 3) }
+            $ls = $content -split "`r?`n"
+            for ($i = 1; $i -lt $ls.Count; $i++) {
+                if ($ls[$i].Trim() -eq '---') {
+                    $body = if ($i + 1 -lt $ls.Count) { ($ls[($i + 1)..($ls.Count - 1)] -join "`n") } else { "" }
+                    break
+                }
+            }
         }
-        $wordCount = ($content -split '\s+' | Where-Object { $_ }).Count
+        $wordCount = ($body -split '\s+' | Where-Object { $_ }).Count
         if ($wordCount -lt 200) {
             $rel = Get-RelPath $article.FullName
             $issues += @{ severity = "suggestion"; check = "sparse_article"; file = $rel;
                 detail = "Sparse article: $wordCount words (min recommended: 200)" }
+        }
+    }
+    return $issues
+}
+
+function Check-ScopeAudit {
+    # Provenance/scope hygiene: every concept must carry type/scope/source_project.
+    # This is an AUDITOR — it only flags, it never moves or relabels files.
+    $issues     = @()
+    $validScope = @('global', 'project')
+    $validType  = @('concept', 'rule')
+
+    foreach ($article in Get-AllArticles) {
+        $rel = Get-RelPath $article.FullName
+        if ($rel -match '^qa[\\/]') { continue }                       # qa/ exempt
+        $isConnection = $rel -match '^connections[\\/]'
+
+        $raw = Get-Content $article.FullName -Raw -Encoding UTF8
+        $f   = Get-ArticleFields $raw
+
+        if (-not $f.scope) {
+            $issues += @{ severity = "warning"; check = "scope_missing"; file = $rel;
+                detail = "Нет поля scope (global|project)" }
+        }
+        elseif ($f.scope.ToLower() -notin $validScope) {
+            $issues += @{ severity = "error"; check = "scope_invalid"; file = $rel;
+                detail = "Недопустимый scope: '$($f.scope)' (ожидается global|project)" }
+        }
+
+        if (-not $f.type) {
+            $issues += @{ severity = "warning"; check = "type_missing"; file = $rel;
+                detail = "Нет поля type (concept|rule)" }
+        }
+        elseif ($f.type.ToLower() -notin $validType) {
+            $issues += @{ severity = "error"; check = "type_invalid"; file = $rel;
+                detail = "Недопустимый type: '$($f.type)' (ожидается concept|rule)" }
+        }
+
+        if (-not $isConnection -and -not $f.source_project) {
+            $issues += @{ severity = "warning"; check = "source_project_missing"; file = $rel;
+                detail = "Нет поля source_project (имя проекта или unknown)" }
         }
     }
     return $issues
@@ -206,7 +253,8 @@ $structuralChecks = @(
     @{ name = "Orphan sources";   fn = { Check-OrphanSources } },
     @{ name = "Stale articles";   fn = { Check-StaleArticles } },
     @{ name = "Missing backlinks";fn = { Check-MissingBacklinks } },
-    @{ name = "Sparse articles";  fn = { Check-SparseArticles } }
+    @{ name = "Sparse articles";  fn = { Check-SparseArticles } },
+    @{ name = "Scope audit";      fn = { Check-ScopeAudit } }
 )
 
 foreach ($check in $structuralChecks) {
