@@ -96,21 +96,31 @@ Write-Host "  Target: $GLOBAL_SETTINGS"
 $hooksDir = Join-Path $ROOT_DIR "hooks"
 
 $hookConfig = @{
-    SessionStart = @(@{ matcher = ""; hooks = @(@{
-        type    = "command"
-        command = "pwsh -NonInteractive -File `"$hooksDir\session-start.ps1`""
-        timeout = 15
+    SessionStart     = @(@{ matcher = ""; hooks = @(@{
+        type = "command"; command = "pwsh -NonInteractive -File `"$hooksDir\session-start.ps1`""; timeout = 15
     })})
-    PreCompact   = @(@{ matcher = ""; hooks = @(@{
-        type    = "command"
-        command = "pwsh -NonInteractive -File `"$hooksDir\pre-compact.ps1`""
-        timeout = 10
+    UserPromptSubmit = @(@{ matcher = ""; hooks = @(@{
+        type = "command"; command = "pwsh -NonInteractive -File `"$hooksDir\user-prompt-submit.ps1`""; timeout = 20
     })})
-    SessionEnd   = @(@{ matcher = ""; hooks = @(@{
-        type    = "command"
-        command = "pwsh -NonInteractive -File `"$hooksDir\session-end.ps1`""
-        timeout = 10
+    PreCompact       = @(@{ matcher = ""; hooks = @(@{
+        type = "command"; command = "pwsh -NonInteractive -File `"$hooksDir\pre-compact.ps1`""; timeout = 10
     })})
+    SessionEnd       = @(@{ matcher = ""; hooks = @(@{
+        type = "command"; command = "pwsh -NonInteractive -File `"$hooksDir\session-end.ps1`""; timeout = 10
+    })})
+}
+
+# Replace only OUR entries for an event (matched by the repo hooks path in the command),
+# preserving any hooks the user added themselves and staying idempotent on repeat runs.
+function Merge-OurHook([hashtable]$Existing, [string]$EventName, $OurEntries, [string]$HooksDir) {
+    if (-not $Existing.ContainsKey('hooks') -or $Existing['hooks'] -isnot [hashtable]) { $Existing['hooks'] = @{} }
+    $cur  = @($Existing['hooks'][$EventName])
+    $kept = @($cur | Where-Object {
+        if (-not $_) { return $false }
+        $cmds = @($_.hooks | ForEach-Object { [string]$_.command })
+        -not (@($cmds | Where-Object { $_ -like "*$HooksDir*" }).Count)
+    })
+    $Existing['hooks'][$EventName] = @($kept + $OurEntries)
 }
 
 $settingsDir = Split-Path $GLOBAL_SETTINGS -Parent
@@ -119,24 +129,26 @@ if (-not (Test-Path $settingsDir)) { New-Item -ItemType Directory -Path $setting
 if (Test-Path $GLOBAL_SETTINGS) {
     try {
         $existing = Get-Content $GLOBAL_SETTINGS -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
-        Write-Host "  Merging into existing settings.json"
+        Write-Host "  Merging into existing settings.json (your other hooks are preserved)"
     } catch {
         Copy-Item $GLOBAL_SETTINGS "$GLOBAL_SETTINGS.bak" -Force
-        Write-Host "  Backed up existing settings.json (parse error)"
+        Write-Host "  Backed up unparseable settings.json -> settings.json.bak"
         $existing = @{}
     }
 } else {
     $existing = @{}
     Write-Host "  Creating new settings.json"
 }
+if ($existing -isnot [hashtable]) { $existing = @{} }
 
-if (-not $existing.ContainsKey('hooks')) { $existing['hooks'] = @{} }
-$existing['hooks']['SessionStart'] = $hookConfig.SessionStart
-$existing['hooks']['PreCompact']   = $hookConfig.PreCompact
-$existing['hooks']['SessionEnd']   = $hookConfig.SessionEnd
+foreach ($evt in @('SessionStart', 'UserPromptSubmit', 'PreCompact', 'SessionEnd')) {
+    Merge-OurHook $existing $evt $hookConfig[$evt] $hooksDir
+}
 
-$existing | ConvertTo-Json -Depth 10 | Set-Content -Path $GLOBAL_SETTINGS -Encoding UTF8
-Write-Host "  Saved."
+# Backup before overwriting a healthy file too — not only on the parse-error path.
+if (Test-Path $GLOBAL_SETTINGS) { Copy-Item $GLOBAL_SETTINGS "$GLOBAL_SETTINGS.bak" -Force }
+$existing | ConvertTo-Json -Depth 32 | Set-Content -Path $GLOBAL_SETTINGS -Encoding UTF8
+Write-Host "  Saved (SessionStart + UserPromptSubmit + PreCompact + SessionEnd; existing hooks preserved)."
 
 # --- Done ---
 Write-Host ""
