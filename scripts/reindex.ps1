@@ -21,10 +21,11 @@ function Get-LeadSentence([string]$Raw) {
     $body = $t
     if ($t.StartsWith("---")) {
         $idx = $t.IndexOf("`n---", 3)
-        if ($idx -ge 0) {
-            $nl = $t.IndexOf("`n", $idx + 1)
-            if ($nl -ge 0) { $body = $t.Substring($nl + 1) }
-        }
+        # Frontmatter opened but never closed → there is no body to summarize. Returning
+        # here avoids leaking a frontmatter line (e.g. "title: ...") as the Summary.
+        if ($idx -lt 0) { return "" }
+        $nl = $t.IndexOf("`n", $idx + 1)
+        if ($nl -ge 0) { $body = $t.Substring($nl + 1) }
     }
     foreach ($line in ($body -split "`r?`n")) {
         $l = $line.Trim()
