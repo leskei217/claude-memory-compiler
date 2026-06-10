@@ -422,7 +422,10 @@ if ($DryRun) {
     exit 0
 }
 
-if ($processed -eq 0 -or $modifiedDates.Count -eq 0) {
+# Compile whenever there are pending dates — even if $processed is 0 this run, which
+# happens on a resume where every session was already deduped but pending_compile still
+# holds dates from an interrupted compile step. Only "no dates at all" means nothing to do.
+if ($modifiedDates.Count -eq 0) {
     Write-Host "`nНечего компилировать."
     exit 0
 }
