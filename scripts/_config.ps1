@@ -117,6 +117,49 @@ function Get-PythonCmd {
     return $null
 }
 
+# Extract user/assistant turns from a Claude Code JSONL transcript as
+# "**<Label>:** <text>" strings. ONE parser shared by the session-end / pre-compact
+# hooks and retrocompile, so transcript handling (roles, content flattening, new block
+# types) can never drift between them.
+function Get-TranscriptTurns {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$UserLabel      = 'User',
+        [string]$AssistantLabel = 'Assistant',
+        [int]$MaxTurnChars      = 0,      # 0 = no per-turn truncation
+        [switch]$SkipInjected             # drop hook-injected payloads (KB index etc.)
+    )
+    $turns = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in (Get-Content -Path $Path -Encoding UTF8)) {
+        $line = $line.Trim()
+        if (-not $line) { continue }
+        try { $entry = $line | ConvertFrom-Json } catch { continue }
+
+        $msg = $entry.message
+        if ($msg -and $msg.PSObject.Properties['role']) { $role = $msg.role; $content = $msg.content }
+        else { $role = $entry.role; $content = $entry.content }
+        if ($role -notin @('user', 'assistant')) { continue }
+
+        # Flatten array content (tool results, image blocks, etc.)
+        if ($content -isnot [string]) {
+            $parts = foreach ($block in @($content)) {
+                if ($block.type -eq 'text') { $block.text } elseif ($block -is [string]) { $block }
+            }
+            $content = (@($parts | Where-Object { $_ }) -join "`n")
+        }
+        $text = ([string]$content).Trim()
+        if (-not $text) { continue }
+        if ($SkipInjected -and $role -eq 'user' -and $text.Length -gt 1000 -and
+            ($text -match 'Knowledge Base Index|SessionStart hook|## Today\b')) { continue }
+        if ($MaxTurnChars -gt 0 -and $text.Length -gt $MaxTurnChars) {
+            $text = $text.Substring(0, $MaxTurnChars) + '…'
+        }
+        $label = if ($role -eq 'user') { $UserLabel } else { $AssistantLabel }
+        $turns.Add("**${label}:** $text")
+    }
+    return , $turns
+}
+
 # --- Project provenance (scope routing) ---
 
 # Decode a Claude Code project-folder name into a readable project label.
