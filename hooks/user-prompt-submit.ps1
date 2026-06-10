@@ -27,14 +27,8 @@ $REPO_DIR = Split-Path $PSScriptRoot -Parent
 $projKey = ""
 $prompt  = ""
 try {
-    $rawIn = [Console]::In.ReadToEnd()
-    if ($rawIn) {
-        try { $hookInput = $rawIn | ConvertFrom-Json }
-        catch {
-            # Fallback: some inputs arrive with un-escaped Windows backslashes in cwd.
-            $fixed     = $rawIn -replace '(?<!\\)\\(?!["\\/bfnrtu])', '\\\\'
-            $hookInput = $fixed | ConvertFrom-Json
-        }
+    $hookInput = Read-HookStdin
+    if ($hookInput) {
         if ($hookInput.cwd)    { $projKey = Get-ProjectKey $hookInput.cwd }
         if ($hookInput.prompt) { $prompt  = [string]$hookInput.prompt }
     }
@@ -87,9 +81,8 @@ try {
             (@($rd | Where-Object { $_ -in $oldDomains }).Count -eq 0)
         })
         if ($newRows.Count) {
-            $tableLines = @(Get-Content $INDEX_FILE -Encoding UTF8 | Where-Object { $_ -match '^\s*\|' })
-            $header     = (@($tableLines | Select-Object -First 2)) -join "`n"
-            $table      = "$header`n" + ((@($newRows | ForEach-Object { $_.raw })) -join "`n")
+            $header = Get-IndexHeader
+            $table  = "$header`n" + ((@($newRows | ForEach-Object { $_.raw })) -join "`n")
             $msg += "`n`nДогружены global-статьи новых доменов (стали релевантны прямо сейчас, $($newRows.Count) шт.):`n`n$table"
         }
     }

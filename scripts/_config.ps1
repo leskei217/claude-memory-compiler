@@ -30,6 +30,7 @@ $KB_LOG_FILE     = Join-Path $KNOWLEDGE_DIR "log.md"
 $STATE_FILE      = Join-Path $CLAUDE_DIR "state.json"
 $FLUSH_LOG       = Join-Path $CLAUDE_DIR "flush.log"
 $REGISTRY_FILE   = Join-Path $CLAUDE_DIR "projects.json"
+$RETRO_STATE_FILE = Join-Path $CLAUDE_DIR "retro-processed.json"
 $DOMAINS_FILE    = Join-Path $CLAUDE_DIR "domains.md"
 $DOMAIN_GAPS_LOG = Join-Path $CLAUDE_DIR "domain-gaps.log"
 
@@ -62,7 +63,65 @@ function Load-State {
 }
 
 function Save-State([hashtable]$State) {
-    $State | ConvertTo-Json -Depth 10 | Set-Content -Path $STATE_FILE -Encoding UTF8
+    # Atomic write: serialize to a temp file then rename over the target. A crash or a
+    # concurrent writer (the end-of-day compile spawn) can no longer leave a half-written
+    # state.json that Load-State would silently reset to defaults.
+    $tmp = "$STATE_FILE.tmp"
+    $State | ConvertTo-Json -Depth 10 | Set-Content -Path $tmp -Encoding UTF8
+    Move-Item -Path $tmp -Destination $STATE_FILE -Force
+}
+
+# Cross-process-safe read-modify-write of state.json. Holds a named mutex (keyed to the
+# state-file path) only for the brief reload→mutate→save window, so two concurrent runs
+# (e.g. the end-of-day compile spawn racing a manual compile, or compile vs its child
+# tag-domains) can't lose each other's updates the way Load→…→Save in each process would.
+# $Mutator receives the freshly-reloaded [hashtable] and mutates it in place.
+function Update-State([scriptblock]$Mutator) {
+    $keyHash = [System.BitConverter]::ToString(
+        [System.Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($STATE_FILE))
+    ).Replace('-', '').Substring(0, 16)
+    $mutex = [System.Threading.Mutex]::new($false, "Global\cmc_state_$keyHash")
+    $owned = $false
+    try {
+        # AbandonedMutex = a previous holder died mid-write; we still get ownership.
+        try { $owned = $mutex.WaitOne(10000) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+        $state = Load-State
+        & $Mutator $state
+        Save-State $state
+        return $state
+    } finally {
+        if ($owned) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+# Read and parse hook stdin JSON. Tries a clean parse first (the normal case — valid JSON);
+# only on failure applies a best-effort fix for un-escaped Windows backslashes (a lone "\"
+# in cwd) and retries. Valid input is never mangled. Returns the parsed object, or $null.
+# Shared by all four hooks so they handle stdin identically.
+function Read-HookStdin {
+    $raw = [Console]::In.ReadToEnd()
+    if (-not $raw) { return $null }
+    try { return ($raw | ConvertFrom-Json) } catch {}
+    try {
+        $fixed = $raw -replace '(?<!\\)\\(?!["\\/bfnrtu])', '\\'
+        return ($fixed | ConvertFrom-Json)
+    } catch { return $null }
+}
+
+# retro-processed.json: which transcript sessions are already in the daily logs.
+# Written by retrocompile (batch) AND flush (live hook), so the schema lives here.
+function Load-RetroState {
+    if (Test-Path $RETRO_STATE_FILE) {
+        try { return (Get-Content $RETRO_STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable) }
+        catch {}
+    }
+    return @{ processed = @{} }
+}
+
+function Save-RetroState([hashtable]$State) {
+    if (-not $State.ContainsKey('processed')) { $State['processed'] = @{} }
+    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $RETRO_STATE_FILE -Encoding UTF8
 }
 
 # Resolve a Python 3 launcher for the optional Excel-review tooling (needs openpyxl).
@@ -72,6 +131,49 @@ function Get-PythonCmd {
     if (Get-Command python  -ErrorAction SilentlyContinue) { return @{ Exe = 'python';  Pre = @() } }
     if (Get-Command python3 -ErrorAction SilentlyContinue) { return @{ Exe = 'python3'; Pre = @() } }
     return $null
+}
+
+# Extract user/assistant turns from a Claude Code JSONL transcript as
+# "**<Label>:** <text>" strings. ONE parser shared by the session-end / pre-compact
+# hooks and retrocompile, so transcript handling (roles, content flattening, new block
+# types) can never drift between them.
+function Get-TranscriptTurns {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$UserLabel      = 'User',
+        [string]$AssistantLabel = 'Assistant',
+        [int]$MaxTurnChars      = 0,      # 0 = no per-turn truncation
+        [switch]$SkipInjected             # drop hook-injected payloads (KB index etc.)
+    )
+    $turns = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in (Get-Content -Path $Path -Encoding UTF8)) {
+        $line = $line.Trim()
+        if (-not $line) { continue }
+        try { $entry = $line | ConvertFrom-Json } catch { continue }
+
+        $msg = $entry.message
+        if ($msg -and $msg.PSObject.Properties['role']) { $role = $msg.role; $content = $msg.content }
+        else { $role = $entry.role; $content = $entry.content }
+        if ($role -notin @('user', 'assistant')) { continue }
+
+        # Flatten array content (tool results, image blocks, etc.)
+        if ($content -isnot [string]) {
+            $parts = foreach ($block in @($content)) {
+                if ($block.type -eq 'text') { $block.text } elseif ($block -is [string]) { $block }
+            }
+            $content = (@($parts | Where-Object { $_ }) -join "`n")
+        }
+        $text = ([string]$content).Trim()
+        if (-not $text) { continue }
+        if ($SkipInjected -and $role -eq 'user' -and $text.Length -gt 1000 -and
+            ($text -match 'Knowledge Base Index|SessionStart hook|## Today\b')) { continue }
+        if ($MaxTurnChars -gt 0 -and $text.Length -gt $MaxTurnChars) {
+            $text = $text.Substring(0, $MaxTurnChars) + '…'
+        }
+        $label = if ($role -eq 'user') { $UserLabel } else { $AssistantLabel }
+        $turns.Add("**${label}:** $text")
+    }
+    return , $turns
 }
 
 # --- Project provenance (scope routing) ---
@@ -194,6 +296,49 @@ function Get-DomainVocabulary {
     return @($vocab | Select-Object -Unique)
 }
 
+# Enumerate knowledge articles (concepts + connections, optionally qa), each subdir
+# sorted by name. One definition instead of nine hand-rolled loops with drifting
+# subdir sets and sort flags.
+function Get-AllArticles([switch]$IncludeQa) {
+    $dirs = @($CONCEPTS_DIR, $CONNECTIONS_DIR)
+    if ($IncludeQa) { $dirs += $QA_DIR }
+    $result = @()
+    foreach ($d in $dirs) {
+        if (Test-Path $d) { $result += Get-ChildItem $d -Filter "*.md" | Sort-Object Name }
+    }
+    return $result
+}
+
+# Knowledge-relative article key: "concepts/foo" (forward slashes, no .md) — the form
+# used as the [[wikilink]] target, the index link, and the hash-store key. Replaces
+# the Get-Rel/Get-RelKey/inline variants that drifted across scripts.
+function Get-ArticleKey([string]$FullPath) {
+    (($FullPath.Substring($KNOWLEDGE_DIR.Length).TrimStart('\', '/')) -replace '\\', '/') -replace '\.md$', ''
+}
+
+# First two table lines of index.md (header + separator) — for rendering filtered
+# index tables. Shared by session-start and the user-prompt-submit top-up.
+function Get-IndexHeader {
+    if (-not (Test-Path $INDEX_FILE)) { return "" }
+    $tableLines = @(Get-Content $INDEX_FILE -Encoding UTF8 | Where-Object { $_ -match '^\s*\|' })
+    return (@($tableLines | Select-Object -First 2)) -join "`n"
+}
+
+# Serialize the whole knowledge base (index + every article) for LLM prompts.
+# Shared by compile and query; $EmptyIndexText is what to show when index.md is missing.
+function Get-AllWikiContent([string]$EmptyIndexText = "(empty — no articles compiled yet)") {
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $idxContent = if (Test-Path $INDEX_FILE) { Get-Content $INDEX_FILE -Raw -Encoding UTF8 } else { $EmptyIndexText }
+    $parts.Add("## INDEX`n`n$idxContent")
+
+    foreach ($md in (Get-AllArticles -IncludeQa)) {
+        $rel     = $md.FullName.Substring($KNOWLEDGE_DIR.Length).TrimStart('\', '/')
+        $content = Get-Content $md.FullName -Raw -Encoding UTF8
+        $parts.Add("## $rel`n`n$content")
+    }
+    return $parts -join "`n`n---`n`n"
+}
+
 # Pragmatic YAML-frontmatter reader. Returns a hashtable of scalar fields (lowercased
 # keys) plus 'first_source'. Not a full YAML parser — handles `key: value` lines and
 # the `sources:` block list. Used by reindex / lint / reclassify.
@@ -243,7 +388,10 @@ function Get-IndexRows {
     $col = @{}
     foreach ($line in (Get-Content $INDEX_FILE -Encoding UTF8)) {
         if ($line -notmatch '^\s*\|') { continue }
-        $cells = ($line.Trim().Trim('|') -split '\|') | ForEach-Object { $_.Trim() }
+        # Split on unescaped pipes only, then un-escape "\|" back to "|" — reindex's
+        # Format-Cell escapes literal pipes in a cell, so a pipe inside a summary must not
+        # be read as a column boundary (which would shift every later column).
+        $cells = ($line.Trim().Trim('|') -split '(?<!\\)\|') | ForEach-Object { ($_.Trim()) -replace '\\\|', '|' }
         if (-not $headerParsed) {
             for ($i = 0; $i -lt $cells.Count; $i++) { $col[$cells[$i].ToLower()] = $i }
             $headerParsed = $true; continue
@@ -299,7 +447,17 @@ function Set-FrontmatterField([string]$Raw, [string]$Key, [string]$Value) {
     $newLine = "${Key}: ${Value}"
     $escKey  = [regex]::Escape($Key)
     for ($i = 1; $i -lt $endIdx; $i++) {
-        if ($lines[$i] -match "^\s*$escKey\s*:") { $lines[$i] = $newLine; return ($lines -join $nl) }
+        if ($lines[$i] -match "^\s*$escKey\s*:") {
+            $lines[$i] = $newLine
+            # If the old value was a YAML block list (domains:\n  - foo\n  - bar), drop its
+            # "- item" continuation lines so they don't dangle under the new inline value
+            # and corrupt the frontmatter. Stops at the next key (no leading "- ").
+            $j = $i + 1
+            while ($j -lt $endIdx -and $lines[$j] -match '^\s+-\s') {
+                $lines.RemoveAt($j); $endIdx--
+            }
+            return ($lines -join $nl)
+        }
     }
     # not present — insert before the first of sources/created/updated (keeps block lists last)
     $insertAt = $endIdx

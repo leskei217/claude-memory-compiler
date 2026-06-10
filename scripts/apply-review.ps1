@@ -61,7 +61,12 @@ foreach ($rec in @($data)) {
     $raw = Get-Content $path -Raw -Encoding UTF8
     if ($rec.scope)   { $raw = Set-FrontmatterField $raw 'scope'          (([string]$rec.scope).Trim().ToLower()) }
     if ($rec.project) { $raw = Set-FrontmatterField $raw 'source_project' (([string]$rec.project).Trim()) }
-    $raw = Set-FrontmatterField $raw 'domains' ('[' + ($doms -join ', ') + ']')
+    # Only write domains when the row actually has ticked ones — an empty set means
+    # "not reviewed", not "clear domains". Writing [] unconditionally wiped existing /
+    # live-tagged domains on every untouched row (incl. qa/, which is never tagged).
+    if ($doms.Count) {
+        $raw = Set-FrontmatterField $raw 'domains' ('[' + ($doms -join ', ') + ']')
+    }
     [System.IO.File]::WriteAllText($path, $raw, [System.Text.Encoding]::UTF8)
     $applied++
 }

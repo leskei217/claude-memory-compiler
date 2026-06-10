@@ -93,7 +93,7 @@ param(
 
 $env:CLAUDE_INVOKED_BY = "retro_compile"
 
-$RETRO_STATE_FILE = Join-Path $CLAUDE_DIR "retro-processed.json"
+# $RETRO_STATE_FILE + Load/Save-RetroState live in _config.ps1 (shared with flush.ps1).
 $TRANSCRIPTS_ROOT = Join-Path $env:USERPROFILE ".claude\projects"
 
 # ---------------------------------------------------------------------------
@@ -105,71 +105,9 @@ function Write-RetroLog([string]$Level, [string]$Msg) {
     "$ts $Level [retrocompile] $Msg" | Add-Content -Path $FLUSH_LOG -Encoding UTF8
 }
 
-function Load-RetroState {
-    if (Test-Path $RETRO_STATE_FILE) {
-        try { return (Get-Content $RETRO_STATE_FILE -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable) }
-        catch {}
-    }
-    return @{ processed = @{} }
-}
-
-function Save-RetroState([hashtable]$State) {
-    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $RETRO_STATE_FILE -Encoding UTF8
-}
-
-# Get-ProjectLabel moved to _config.ps1 (shared with hooks).
-
-function Extract-Turns([string]$FilePath) {
-    $turns = [System.Collections.Generic.List[string]]::new()
-
-    $prevEncoding = [Console]::OutputEncoding
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-
-    try {
-        foreach ($line in (Get-Content -Path $FilePath -Encoding UTF8)) {
-            $line = $line.Trim()
-            if (-not $line) { continue }
-            try { $entry = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-
-            $msg = $entry.message
-            if ($msg -and $msg.PSObject.Properties['role']) {
-                $role    = $msg.role
-                $content = $msg.content
-            }
-            else {
-                $role    = $entry.role
-                $content = $entry.content
-            }
-
-            if ($role -notin @("user", "assistant")) { continue }
-
-            # Flatten array content (tool results, image blocks, etc.)
-            if ($content -isnot [string]) {
-                $parts = foreach ($block in @($content)) {
-                    if ($block.type -eq "text")     { $block.text }
-                    elseif ($block -is [string])    { $block }
-                }
-                $content = ($parts | Where-Object { $_ }) -join "`n"
-            }
-
-            $text = ([string]$content).Trim()
-            if (-not $text) { continue }
-
-            # Skip hook injection payloads (system context, tool noise)
-            if ($role -eq "user" -and $text.Length -gt 1000 -and
-                ($text -match "Knowledge Base Index|SessionStart hook|## Today\b")) { continue }
-
-            $label     = if ($role -eq "user") { "Пользователь" } else { "Клод" }
-            $truncated = if ($text.Length -gt 800) { $text.Substring(0, 800) + "…" } else { $text }
-            $turns.Add("**${label}:** $truncated")
-        }
-    }
-    finally {
-        [Console]::OutputEncoding = $prevEncoding
-    }
-
-    return , $turns   # force [array] return
-}
+# Get-ProjectLabel and the transcript parser moved to _config.ps1 (shared with hooks):
+# retro reads the same JSONL via Get-TranscriptTurns with Russian labels, 800-char
+# per-turn truncation and hook-injection skipping.
 
 function Ensure-DailyLog([string]$Date) {
     $logPath = Join-Path $DAILY_DIR "$Date.md"
@@ -186,45 +124,8 @@ function Append-RetroEntry([string]$LogPath, [string]$Content, [string]$TimeStr,
     [System.IO.File]::AppendAllText($LogPath, $entry, [System.Text.Encoding]::UTF8)
 }
 
-function Get-QualitySummary([string]$Context) {
-    $prevEncoding = [Console]::OutputEncoding
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    try {
-        $prompt = @"
-Проанализируй контекст разговора ниже и ответь кратким резюме важных моментов для сохранения в дневном логе.
-Не используй никакие инструменты — только обычный текст.
-ВАЖНО: Отвечай ТОЛЬКО на русском языке.
-
-Оформи ответ как структурированную запись дневного лога с разделами:
-
-**Контекст:** [Одна строка о том, чем занимался пользователь]
-
-**Ключевые обмены:**
-- [Важные вопросы и ответы, обсуждения]
-
-**Принятые решения:**
-- [Любые решения с обоснованием]
-
-**Выводы:**
-- [Подводные камни, паттерны, инсайты]
-
-**Задачи:**
-- [Упомянутые последующие шаги или TODO]
-
-Пропускай рутинные вызовы инструментов, тривиальные чтения файлов и очевидный back-and-forth.
-Включай только разделы с реальным содержимым.
-Если ничего не стоит сохранять, ответь ровно: FLUSH_OK
-
-## Контекст разговора
-
-$Context
-"@
-        return Invoke-ClaudeCLI -Prompt $prompt
-    }
-    finally {
-        [Console]::OutputEncoding = $prevEncoding
-    }
-}
+# Get-QualitySummary replaced by the shared Get-FlushSummary in _api.ps1 (same prompt
+# as the live flush, so the daily-log entry shape never drifts).
 
 # ---------------------------------------------------------------------------
 # Main
@@ -320,7 +221,7 @@ foreach ($file in $allFiles) {
     $batchCount++
 
     # Extract turns
-    $turns = Extract-Turns -FilePath $file.FullName
+    $turns = Get-TranscriptTurns -Path $file.FullName -UserLabel 'Пользователь' -AssistantLabel 'Клод' -MaxTurnChars 800 -SkipInjected
 
     if ($turns.Count -lt $MinTurns) {
         Write-Host "  SKIP  [$date $timeStr] $projectLabel — $($turns.Count) реплик" -ForegroundColor DarkGray
@@ -343,11 +244,11 @@ foreach ($file in $allFiles) {
             $batchProcessed++
         }
         else {
-            # Build context (last 30 turns, max 15000 chars)
-            $recent  = if ($turns.Count -gt 30) { $turns | Select-Object -Last 30 } else { $turns }
+            # Build context (last $MAX_TURNS turns, max $MAX_CONTEXT_CHARS chars — _config)
+            $recent  = if ($turns.Count -gt $MAX_TURNS) { $turns | Select-Object -Last $MAX_TURNS } else { $turns }
             $context = $recent -join "`n`n"
-            if ($context.Length -gt 15000) {
-                $context  = $context.Substring($context.Length - 15000)
+            if ($context.Length -gt $MAX_CONTEXT_CHARS) {
+                $context  = $context.Substring($context.Length - $MAX_CONTEXT_CHARS)
                 $boundary = $context.IndexOf("`n`n**")
                 if ($boundary -gt 0) { $context = $context.Substring($boundary + 2) }
             }
@@ -356,7 +257,7 @@ foreach ($file in $allFiles) {
 
             try {
                 if ($Mode -eq "Quality") {
-                    $summary = Get-QualitySummary -Context $context
+                    $summary = Get-FlushSummary -Context $context
                     if ($summary -match "^\s*FLUSH_OK\s*$") {
                         Write-Host "         → ничего ценного (FLUSH_OK)" -ForegroundColor DarkGray
                         $flushedOk++
@@ -422,7 +323,10 @@ if ($DryRun) {
     exit 0
 }
 
-if ($processed -eq 0 -or $modifiedDates.Count -eq 0) {
+# Compile whenever there are pending dates — even if $processed is 0 this run, which
+# happens on a resume where every session was already deduped but pending_compile still
+# holds dates from an interrupted compile step. Only "no dates at all" means nothing to do.
+if ($modifiedDates.Count -eq 0) {
     Write-Host "`nНечего компилировать."
     exit 0
 }
@@ -437,18 +341,15 @@ if ($NoCompile) {
 Write-Host ""
 Write-Host "Компилирую $($modifiedDates.Count) дневных лог(а) в knowledge base..." -ForegroundColor Cyan
 $compilePs = Join-Path $SCRIPTS_DIR "compile.ps1"
-$state     = Load-State
 
 $compileErrors = 0
 foreach ($date in ($modifiedDates | Sort-Object)) {
     $logPath = Join-Path $DAILY_DIR "$date.md"
     Write-Host "`n  $date.md"
 
-    # Force recompile by clearing cached hash
-    if ($state.ContainsKey('ingested') -and $state['ingested'].ContainsKey("$date.md")) {
-        $state['ingested'].Remove("$date.md")
-        Save-State $state
-    }
+    # Force recompile by clearing the cached hash — atomic, because the compile spawned
+    # below writes ingested between iterations and a stale in-memory snapshot would clobber it.
+    Update-State { param($s) if ($s.ContainsKey('ingested')) { $s['ingested'].Remove("$date.md") } } | Out-Null
 
     try {
         & pwsh -NonInteractive -File $compilePs -Log $logPath

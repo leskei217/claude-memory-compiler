@@ -27,29 +27,29 @@ if (Test-Path $OUT) {
 }
 if ($sug -isnot [hashtable]) { $sug = @{} }
 
-$articles = @()
-foreach ($d in @($CONCEPTS_DIR, $CONNECTIONS_DIR)) {
-    if (Test-Path $d) { $articles += Get-ChildItem $d -Filter "*.md" | Sort-Object Name }
-}
-function Get-RelKey([string]$Full) { (($Full.Substring($KNOWLEDGE_DIR.Length).TrimStart('\', '/')) -replace '\\', '/') -replace '\.md$', '' }
+$articles = @(Get-AllArticles)   # concepts + connections (qa is never domain-tagged)
 
-$pending = @($articles | Where-Object { $Force -or -not $sug.ContainsKey((Get-RelKey $_.FullName)) })
+$pending = @($articles | Where-Object { $Force -or -not $sug.ContainsKey((Get-ArticleKey $_.FullName)) })
 if ($Limit -gt 0) { $pending = $pending | Select-Object -First $Limit }
 $pending = @($pending)
 
 Write-Host "Домены: $($articles.Count) статей, к обработке $($pending.Count). Словарь: $($vocab.Count) доменов."
 
-$i = 0
+$i = 0; $dirty = $false
 foreach ($a in $pending) {
     $i++
-    $key    = Get-RelKey $a.FullName
+    $key    = Get-ArticleKey $a.FullName
     $body   = Get-Content $a.FullName -Raw -Encoding UTF8
     try { $picked = @(Get-DomainsForArticle -Body $body -Vocab $vocab) }
     catch { Write-Host "  ! $($a.Name): ошибка LLM, пропуск"; continue }
 
     $sug[$key] = $picked
-    $sug | ConvertTo-Json -Depth 5 | Set-Content -Path $OUT -Encoding UTF8
+    $dirty = $true
+    # Checkpoint every 10 instead of rewriting the whole growing JSON each article
+    # (was O(n^2) writes); resumability loses at most the last 10 on a crash.
+    if ($i % 10 -eq 0) { $sug | ConvertTo-Json -Depth 5 | Set-Content -Path $OUT -Encoding UTF8; $dirty = $false }
     Write-Host "  [$i/$($pending.Count)] $($a.Name) -> $(if ($picked.Count) { $picked -join ', ' } else { '(нет)' })"
 }
+if ($dirty) { $sug | ConvertTo-Json -Depth 5 | Set-Content -Path $OUT -Encoding UTF8 }
 
 Write-Host "`nГотово. Подсказки доменов: $OUT"

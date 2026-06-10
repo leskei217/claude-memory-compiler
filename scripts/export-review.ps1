@@ -17,32 +17,29 @@ if (Test-Path $SUGFILE) {
 $vocab = @(Get-DomainVocabulary)
 
 $records = [System.Collections.Generic.List[object]]::new()
-foreach ($d in @($CONCEPTS_DIR, $CONNECTIONS_DIR, $QA_DIR)) {
-    if (-not (Test-Path $d)) { continue }
-    foreach ($md in (Get-ChildItem $d -Filter "*.md" | Sort-Object Name)) {
-        $raw = Get-Content $md.FullName -Raw -Encoding UTF8
-        $f   = Get-ArticleFields $raw
-        $rel = (($md.FullName.Substring($KNOWLEDGE_DIR.Length).TrimStart('\', '/')) -replace '\\', '/') -replace '\.md$', ''
+foreach ($md in (Get-AllArticles -IncludeQa)) {
+    $raw = Get-Content $md.FullName -Raw -Encoding UTF8
+    $f   = Get-ArticleFields $raw
+    $rel = Get-ArticleKey $md.FullName
 
-        # current = domains already in frontmatter (empty → needs tagging)
-        $cur = @()
-        if ($f.domains) {
-            $cur = @(($f.domains -replace '[\[\]"]', '') -split '[,;]' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
-        }
-        # domains = checkbox prefill: current if present, else LLM suggestion
-        $dom = if ($cur.Count) { $cur } elseif ($sug.ContainsKey($rel)) { @($sug[$rel]) } else { @() }
-
-        $records.Add([pscustomobject]@{
-            file    = $rel
-            title   = [string]$f.title
-            type    = [string]$f.type
-            scope   = [string]$f.scope
-            project = [string]$f.source_project
-            summary = [string]$f.summary
-            current = @($cur | Where-Object { $_ -in $vocab } | Select-Object -Unique)
-            domains = @($dom | Where-Object { $_ -in $vocab } | Select-Object -Unique)
-        })
+    # current = domains already in frontmatter (empty → needs tagging)
+    $cur = @()
+    if ($f.domains) {
+        $cur = @(($f.domains -replace '[\[\]"]', '') -split '[,;]' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
     }
+    # domains = checkbox prefill: current if present, else LLM suggestion
+    $dom = if ($cur.Count) { $cur } elseif ($sug.ContainsKey($rel)) { @($sug[$rel]) } else { @() }
+
+    $records.Add([pscustomobject]@{
+        file    = $rel
+        title   = [string]$f.title
+        type    = [string]$f.type
+        scope   = [string]$f.scope
+        project = [string]$f.source_project
+        summary = [string]$f.summary
+        current = @($cur | Where-Object { $_ -in $vocab } | Select-Object -Unique)
+        domains = @($dom | Where-Object { $_ -in $vocab } | Select-Object -Unique)
+    })
 }
 
 $out = Join-Path $CLAUDE_DIR "review-data.json"

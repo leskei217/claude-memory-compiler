@@ -11,21 +11,17 @@ $REPO_DIR = Split-Path $PSScriptRoot -Parent
 . (Join-Path $REPO_DIR "scripts\_config.ps1")   # paths + project helpers
 $FLUSH_PS1 = Join-Path $SCRIPTS_DIR "flush.ps1"
 
-$MAX_TURNS         = 30
-$MAX_CONTEXT_CHARS = 15000
-$MIN_TURNS         = 5
+# MAX_TURNS / MAX_CONTEXT_CHARS come from _config.ps1 (shared flush-window tuning).
+$MIN_TURNS = 5
 
 function Write-Log([string]$Level, [string]$Msg) {
     $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     "$ts $Level [pre-compact] $Msg" | Add-Content -Path $FLUSH_LOG -Encoding UTF8
 }
 
-try {
-    $rawInput = [Console]::In.ReadToEnd()
-    $rawInput = $rawInput -replace '(?<!\\)\\(?!["\\/bfnrtu])', '\\\\'
-    $hookInput = $rawInput | ConvertFrom-Json
-} catch {
-    Write-Log "ERROR" "Failed to parse stdin: $_"
+$hookInput = Read-HookStdin
+if (-not $hookInput) {
+    Write-Log "ERROR" "Failed to parse stdin"
     exit 0
 }
 
@@ -40,31 +36,8 @@ if (-not $transcriptStr -or -not (Test-Path $transcriptStr)) {
     exit 0
 }
 
-$turns = [System.Collections.Generic.List[string]]::new()
-
-foreach ($line in (Get-Content -Path $transcriptStr -Encoding UTF8)) {
-    $line = $line.Trim()
-    if (-not $line) { continue }
-    try { $entry = $line | ConvertFrom-Json } catch { continue }
-
-    $msg = $entry.message
-    if ($msg -and $msg.PSObject.Properties['role']) { $role = $msg.role; $content = $msg.content }
-    else { $role = $entry.role; $content = $entry.content }
-
-    if ($role -notin @("user", "assistant")) { continue }
-
-    if ($content -isnot [string]) {
-        $parts = foreach ($block in @($content)) {
-            if ($block.type -eq "text") { $block.text } elseif ($block -is [string]) { $block }
-        }
-        $content = $parts -join "`n"
-    }
-
-    $text = [string]$content
-    if (-not $text.Trim()) { continue }
-    $label = if ($role -eq "user") { "User" } else { "Assistant" }
-    $turns.Add("**${label}:** $($text.Trim())`n")
-}
+# --- Extract turns from JSONL transcript (shared parser in _config.ps1) ---
+$turns = Get-TranscriptTurns -Path $transcriptStr
 
 if ($turns.Count -lt $MIN_TURNS) {
     Write-Log "INFO" "SKIP: only $($turns.Count) turns (min $MIN_TURNS)"
@@ -72,7 +45,7 @@ if ($turns.Count -lt $MIN_TURNS) {
 }
 
 $recent  = if ($turns.Count -gt $MAX_TURNS) { $turns | Select-Object -Last $MAX_TURNS } else { $turns }
-$context = $recent -join "`n"
+$context = $recent -join "`n`n"
 
 if ($context.Length -gt $MAX_CONTEXT_CHARS) {
     $context  = $context.Substring($context.Length - $MAX_CONTEXT_CHARS)

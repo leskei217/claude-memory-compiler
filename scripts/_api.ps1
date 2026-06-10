@@ -49,7 +49,8 @@ function Invoke-ParseFileOps {
         [Parameter(Mandatory)]
         [string]$Text,
         [Parameter(Mandatory)]
-        [string]$RootDir
+        [string]$RootDir,
+        [string]$AllowedSubdir = ""
     )
 
     $pattern = [regex]::new(
@@ -68,7 +69,7 @@ function Invoke-ParseFileOps {
 
         $result = Invoke-FileTool -ToolName ($action.ToLower() + "_file") `
             -ToolInput @{ path = $relPath; content = $content } `
-            -RootDir $RootDir
+            -RootDir $RootDir -AllowedSubdir $AllowedSubdir
         Write-Host "    $result"
         $count++
     }
@@ -83,11 +84,15 @@ function Invoke-FileTool {
         [Parameter(Mandatory)]
         $ToolInput,
         [Parameter(Mandatory)]
-        [string]$RootDir
+        [string]$RootDir,
+        [string]$AllowedSubdir = ""
     )
 
     $path = $ToolInput.path
     if (-not [System.IO.Path]::IsPathRooted($path)) {
+        # A ':' in a relative path means a drive-relative path (C:foo) or an NTFS alternate
+        # data stream (a.md:hidden) — neither is a legitimate knowledge-base file op.
+        if ($path.Contains(':')) { return "Error: suspicious ':' in relative path '$path'." }
         $path = Join-Path $RootDir $path
     }
     $realPath = [System.IO.Path]::GetFullPath($path)
@@ -96,6 +101,15 @@ function Invoke-FileTool {
     $sep = [System.IO.Path]::DirectorySeparatorChar
     if (-not $realPath.StartsWith($realRoot + $sep) -and $realPath -ne $realRoot) {
         return "Error: '$realPath' is outside project directory."
+    }
+    # Optional allowlist: confine writes to one subdirectory (compile/query pass 'knowledge'),
+    # so a prompt-injected <<<WRITE>>> can't reach domains.md / projects.json / state.json,
+    # which live in $CLAUDE_DIR but outside knowledge/.
+    if ($AllowedSubdir) {
+        $realAllowed = [System.IO.Path]::GetFullPath((Join-Path $realRoot $AllowedSubdir))
+        if (-not $realPath.StartsWith($realAllowed + $sep) -and $realPath -ne $realAllowed) {
+            return "Error: '$realPath' is outside allowed subdir '$AllowedSubdir'."
+        }
     }
 
     $dir = [System.IO.Path]::GetDirectoryName($realPath)
@@ -114,6 +128,45 @@ function Invoke-FileTool {
         }
         default { return "Unknown tool: $ToolName" }
     }
+}
+
+# Summarize a conversation context into the structured daily-log entry. ONE prompt
+# shared by the live flush (flush.ps1) and retrocompile's Quality mode, so the
+# daily-log shape and the FLUSH_OK sentinel never drift between the two writers.
+# Returns the raw LLM text ("FLUSH_OK" when nothing is worth saving).
+function Get-FlushSummary {
+    param([Parameter(Mandatory)][string]$Context)
+
+    $prompt = @"
+Проанализируй контекст разговора ниже и ответь кратким резюме важных моментов для сохранения в дневном логе.
+Не используй никакие инструменты — только обычный текст.
+ВАЖНО: Отвечай ТОЛЬКО на русском языке.
+
+Оформи ответ как структурированную запись дневного лога с разделами:
+
+**Контекст:** [Одна строка о том, чем занимался пользователь]
+
+**Ключевые обмены:**
+- [Важные вопросы и ответы, обсуждения]
+
+**Принятые решения:**
+- [Любые решения с обоснованием]
+
+**Выводы:**
+- [Подводные камни, паттерны, инсайты]
+
+**Задачи:**
+- [Упомянутые последующие шаги или TODO]
+
+Пропускай рутинные вызовы инструментов, тривиальные чтения файлов и очевидный back-and-forth.
+Включай только разделы с реальным содержимым.
+Если ничего не стоит сохранять, ответь ровно: FLUSH_OK
+
+## Контекст разговора
+
+$Context
+"@
+    return Invoke-ClaudeCLI -Prompt $prompt
 }
 
 # Classify an article body into knowledge DOMAINS, picking ONLY from the controlled

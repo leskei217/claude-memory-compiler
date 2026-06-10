@@ -22,34 +22,14 @@ param(
 
 $env:CLAUDE_INVOKED_BY = "memory_compile"
 
-function Get-AllWikiContent {
-    $parts = [System.Collections.Generic.List[string]]::new()
-
-    $idxContent = if (Test-Path $INDEX_FILE) {
-        Get-Content $INDEX_FILE -Raw -Encoding UTF8
-    }
-    else {
-        "# Knowledge Base Index`n`n| Article | Summary | Compiled From | Updated |`n|---------|---------|---------------|---------|"
-    }
-    $parts.Add("## INDEX`n`n$idxContent")
-
-    foreach ($subdir in @($CONCEPTS_DIR, $CONNECTIONS_DIR, $QA_DIR)) {
-        if (-not (Test-Path $subdir)) { continue }
-        foreach ($md in (Get-ChildItem $subdir -Filter "*.md" | Sort-Object Name)) {
-            $rel     = $md.FullName.Substring($KNOWLEDGE_DIR.Length).TrimStart('\', '/')
-            $content = Get-Content $md.FullName -Raw -Encoding UTF8
-            $parts.Add("## $rel`n`n$content")
-        }
-    }
-    return $parts -join "`n`n---`n`n"
-}
+# Get-AllWikiContent moved to _config.ps1 (shared with query.ps1).
 
 function Invoke-CompileLog {
     param([string]$LogPath)
 
     $logContent  = Get-Content $LogPath -Raw -Encoding UTF8
     $schema      = if (Test-Path $AGENTS_FILE) { Get-Content $AGENTS_FILE -Raw -Encoding UTF8 } else { "(AGENTS.md not found)" }
-    $wikiContent = Get-AllWikiContent
+    $wikiContent = Get-AllWikiContent -EmptyIndexText "# Knowledge Base Index`n`n| Article | Summary | Compiled From | Updated |`n|---------|---------|---------------|---------|"
     $timestamp   = Get-NowIso
 
     $prompt = @"
@@ -101,7 +81,7 @@ $logContent
 
     Write-Host "  Calling claude CLI..."
     $response = Invoke-ClaudeCLI -Prompt $prompt
-    $opsCount = Invoke-ParseFileOps -Text $response -RootDir $CLAUDE_DIR
+    $opsCount = Invoke-ParseFileOps -Text $response -RootDir $CLAUDE_DIR -AllowedSubdir 'knowledge'
     Write-Host "  Executed $opsCount file operation(s)"
 }
 
@@ -149,12 +129,13 @@ foreach ($logPath in @($toCompile)) {
     try {
         Invoke-CompileLog -LogPath $logPath
 
-        if (-not $state.ContainsKey('ingested')) { $state['ingested'] = @{} }
-        $state['ingested'][$leafName] = @{
-            hash        = Get-FileHash256 $logPath
-            compiled_at = Get-NowIso
+        $logHash    = Get-FileHash256 $logPath
+        $compiledAt = Get-NowIso
+        $state = Update-State {
+            param($s)
+            if (-not $s.ContainsKey('ingested')) { $s['ingested'] = @{} }
+            $s['ingested'][$leafName] = @{ hash = $logHash; compiled_at = $compiledAt }
         }
-        Save-State $state
         Write-Host "  Done."
     }
     catch {
@@ -179,8 +160,5 @@ if (Test-Path $reindexPs) {
     try { & $reindexPs } catch { Write-Host "  WARNING: reindex.ps1 failed — index may be stale: $_" }
 }
 
-$articles = @()
-foreach ($subdir in @($CONCEPTS_DIR, $CONNECTIONS_DIR, $QA_DIR)) {
-    if (Test-Path $subdir) { $articles += Get-ChildItem $subdir -Filter "*.md" }
-}
+$articles = @(Get-AllArticles -IncludeQa)
 Write-Host "`nDone. Knowledge base: $($articles.Count) articles"

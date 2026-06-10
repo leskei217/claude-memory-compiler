@@ -21,7 +21,19 @@ CHECKED = {"x", "х", "✓", "v", "1", "true", "y", "yes", "да", "+"}
 wb = openpyxl.load_workbook(BRAIN / "review.xlsx")
 ws = wb.active
 hdr = [c.value for c in ws[1]]
-idx = {h: i for i, h in enumerate(hdr)}
+# Build the column index, rejecting duplicate headers. A dict comprehension would silently
+# keep the LAST index for a repeated name, remapping base-field reads to the wrong column
+# (and a domain whose name collides with a base column would be lost). Fail loudly instead.
+idx = {}
+for i, h in enumerate(hdr):
+    if h is None:
+        continue
+    if h in idx:
+        raise SystemExit(
+            f"ОШИБКА: дублирующийся заголовок '{h}' в review.xlsx "
+            f"(колонки {idx[h] + 1} и {i + 1}). Переименуй или убери дубль и повтори."
+        )
+    idx[h] = i
 if "file" not in idx:
     raise SystemExit("ОШИБКА: в заголовке review.xlsx нет колонки 'file'.")
 base_set = {"file", "title", "type", "scope", "project", "summary", "current"}

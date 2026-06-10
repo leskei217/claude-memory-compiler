@@ -32,10 +32,7 @@ $env:CLAUDE_INVOKED_BY = "memory_domains"
 $vocab = @(Get-DomainVocabulary)
 if ($vocab.Count -eq 0) { Write-Host "Словарь доменов пуст: $DOMAINS_FILE"; exit 1 }
 
-$articles = @()
-foreach ($d in @($CONCEPTS_DIR, $CONNECTIONS_DIR)) {
-    if (Test-Path $d) { $articles += Get-ChildItem $d -Filter "*.md" | Sort-Object Name }
-}
+$articles = @(Get-AllArticles)   # concepts + connections (qa is never domain-tagged)
 
 # True if the article already carries at least one real domain (not empty / not `[]`).
 function Test-HasDomains([string]$Raw) {
@@ -44,25 +41,22 @@ function Test-HasDomains([string]$Raw) {
     return (($d -replace '[\[\]",\s]', '') -ne '')
 }
 
-function Get-Rel($Article) {
-    (($Article.FullName.Substring($KNOWLEDGE_DIR.Length).TrimStart('\', '/')) -replace '\\', '/') -replace '\.md$', ''
-}
-
 # --- Decide which articles need (re)classification via the content-hash store ---
 $state = Load-State
 if (-not $state.ContainsKey('domains_tagged')) { $state['domains_tagged'] = @{} }
-$tagState = $state['domains_tagged']
+$tagState   = $state['domains_tagged']   # snapshot, for skip/seed read decisions
+$tagUpdates = @{}                        # writes accumulate here, applied atomically at the end
 
 $toClassify = @()
 $skipped = 0; $seeded = 0
 foreach ($a in $articles) {
-    $rel = Get-Rel $a
+    $rel = Get-ArticleKey $a.FullName
     $cur = Get-FileHash256 $a.FullName
 
     if (-not $Force) {
         if ($tagState[$rel] -eq $cur) { $skipped++; continue }            # unchanged since last tag
         if (-not $tagState.ContainsKey($rel) -and (Test-HasDomains (Get-Content $a.FullName -Raw -Encoding UTF8))) {
-            if (-not $DryRun) { $tagState[$rel] = $cur }                  # migration seed: trust existing domains
+            if (-not $DryRun) { $tagUpdates[$rel] = $cur }                # migration seed: trust existing domains
             $seeded++; continue
         }
     }
@@ -83,7 +77,7 @@ foreach ($c in $toClassify) {
 
     if ($picked.Count -eq 0) {
         Write-Host "  [$i/$($toClassify.Count)] $($c.file.Name) -> (нет подходящих)"
-        if (-not $DryRun) { $tagState[$c.rel] = $c.hash }                 # asked once; don't re-ask until it changes
+        if (-not $DryRun) { $tagUpdates[$c.rel] = $c.hash }              # asked once; don't re-ask until it changes
         continue
     }
 
@@ -91,10 +85,16 @@ foreach ($c in $toClassify) {
     if (-not $DryRun) {
         $new = Set-FrontmatterField $raw 'domains' "[$($picked -join ', ')]"
         [System.IO.File]::WriteAllText($c.file.FullName, $new, [System.Text.Encoding]::UTF8)
-        $tagState[$c.rel] = Get-FileHash256 $c.file.FullName             # store the post-write hash
+        $tagUpdates[$c.rel] = Get-FileHash256 $c.file.FullName           # store the post-write hash
         $tagged++
     }
 }
 
-if (-not $DryRun) { Save-State $state }
+if (-not $DryRun -and $tagUpdates.Count) {
+    Update-State {
+        param($s)
+        if (-not $s.ContainsKey('domains_tagged')) { $s['domains_tagged'] = @{} }
+        foreach ($k in $tagUpdates.Keys) { $s['domains_tagged'][$k] = $tagUpdates[$k] }
+    } | Out-Null
+}
 Write-Host "`nГотово. Проставлено: $tagged | без изменений: $skipped | засеяно: $seeded | ошибок LLM: $failed$(if ($DryRun) { ' (dry-run, ничего не записано)' })."

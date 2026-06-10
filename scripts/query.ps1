@@ -19,24 +19,7 @@ param(
 
 $env:CLAUDE_INVOKED_BY = "memory_query"
 
-function Get-AllWikiContent {
-    $parts = [System.Collections.Generic.List[string]]::new()
-    $idxContent = if (Test-Path $INDEX_FILE) {
-        Get-Content $INDEX_FILE -Raw -Encoding UTF8
-    } else { "(empty — no articles compiled yet)" }
-    $parts.Add("## INDEX`n`n$idxContent")
-
-    foreach ($subdir in @($CONCEPTS_DIR, $CONNECTIONS_DIR, $QA_DIR)) {
-        if (-not (Test-Path $subdir)) { continue }
-        foreach ($md in (Get-ChildItem $subdir -Filter "*.md" | Sort-Object Name)) {
-            $rel     = $md.FullName.Substring($KNOWLEDGE_DIR.Length).TrimStart('\', '/')
-            $content = Get-Content $md.FullName -Raw -Encoding UTF8
-            $parts.Add("## $rel`n`n$content")
-        }
-    }
-    return $parts -join "`n`n---`n`n"
-}
-
+# Get-AllWikiContent moved to _config.ps1 (shared with compile.ps1).
 $wikiContent = Get-AllWikiContent
 $timestamp   = Get-NowIso
 
@@ -99,10 +82,8 @@ try {
         Write-Host $answer
         Write-Host ""
 
-        $opsCount = Invoke-ParseFileOps -Text $response -RootDir $ROOT_DIR
-        $state = Load-State
-        $state['query_count'] = ($state['query_count'] ?? 0) + 1
-        Save-State $state
+        $opsCount = Invoke-ParseFileOps -Text $response -RootDir $CLAUDE_DIR -AllowedSubdir 'knowledge'
+        Update-State { param($s) $s['query_count'] = ([int]($s['query_count'] ?? 0)) + 1 } | Out-Null
 
         Write-Host "`n$("-" * 60)"
         $qaCount = if (Test-Path $QA_DIR) { @(Get-ChildItem $QA_DIR -Filter "*.md").Count } else { 0 }
@@ -110,9 +91,7 @@ try {
     }
     else {
         Write-Host $response
-        $state = Load-State
-        $state['query_count'] = ($state['query_count'] ?? 0) + 1
-        Save-State $state
+        Update-State { param($s) $s['query_count'] = ([int]($s['query_count'] ?? 0)) + 1 } | Out-Null
     }
 }
 catch {

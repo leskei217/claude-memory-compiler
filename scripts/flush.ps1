@@ -79,7 +79,7 @@ if (-not (Test-Path $ContextFile)) {
 $flushState = Load-FlushState
 $lastTs     = $flushState['timestamp']
 if ($flushState['session_id'] -eq $SessionId -and
-    $lastTs -and ((Get-Date) - [DateTimeOffset]::FromUnixTimeSeconds($lastTs)).TotalSeconds -lt 60) {
+    $lastTs -and (([DateTimeOffset]::Now - [DateTimeOffset]::FromUnixTimeSeconds($lastTs)).TotalSeconds -lt 60)) {
     Write-FlushLog "INFO" "Skipping duplicate flush for session $SessionId"
     Remove-Item $ContextFile -Force -ErrorAction SilentlyContinue
     exit 0
@@ -94,38 +94,9 @@ if (-not $context) {
 
 Write-FlushLog "INFO" "Flushing session ${SessionId}: $($context.Length) chars"
 
-$prompt = @"
-Проанализируй контекст разговора ниже и ответь кратким резюме важных моментов для сохранения в дневном логе.
-Не используй никакие инструменты — только обычный текст.
-ВАЖНО: Отвечай ТОЛЬКО на русском языке.
-
-Оформи ответ как структурированную запись дневного лога с разделами:
-
-**Контекст:** [Одна строка о том, чем занимался пользователь]
-
-**Ключевые обмены:**
-- [Важные вопросы и ответы, обсуждения]
-
-**Принятые решения:**
-- [Любые решения с обоснованием]
-
-**Выводы:**
-- [Подводные камни, паттерны, инсайты]
-
-**Задачи:**
-- [Упомянутые последующие шаги или TODO]
-
-Пропускай рутинные вызовы инструментов, тривиальные чтения файлов и очевидный back-and-forth.
-Включай только разделы с реальным содержимым.
-Если ничего не стоит сохранять, ответь ровно: FLUSH_OK
-
-## Conversation Context
-
-$context
-"@
-
 try {
-    $result = Invoke-ClaudeCLI -Prompt $prompt
+    # Shared flush prompt (Get-FlushSummary in _api.ps1) — same as retrocompile Quality mode.
+    $result = Get-FlushSummary -Context $context
 
     if ($result -match "FLUSH_OK") {
         Write-FlushLog "INFO" "Result: FLUSH_OK"
@@ -149,18 +120,16 @@ Save-FlushState @{ session_id = $SessionId; timestamp = [DateTimeOffset]::UtcNow
 Remove-Item $ContextFile -Force -ErrorAction SilentlyContinue
 
 # Register this session in retro-processed.json so retrocompile skips it
-$retroFile = Join-Path $CLAUDE_DIR "retro-processed.json"
+# (shared Load/Save-RetroState from _config.ps1 — same schema as retrocompile).
 try {
-    $retroState = if (Test-Path $retroFile) {
-        Get-Content $retroFile -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
-    } else { @{ processed = @{} } }
+    $retroState = Load-RetroState
     if (-not $retroState.ContainsKey('processed')) { $retroState['processed'] = @{} }
     $retroState['processed'][$SessionId] = @{
         project      = "hook"
         processed_at = (Get-NowIso)
         mode         = "flush"
     }
-    $retroState | ConvertTo-Json -Depth 5 | Set-Content -Path $retroFile -Encoding UTF8
+    Save-RetroState $retroState
 } catch {
     Write-FlushLog "WARN" "Could not update retro-processed.json: $_"
 }
@@ -183,10 +152,16 @@ if ($hour -ge $COMPILE_AFTER_HOUR) {
         if (-not $alreadyCompiled) {
             Write-FlushLog "INFO" "Triggering end-of-day compilation (after ${COMPILE_AFTER_HOUR}:00)"
             try {
+                # Per-process log names ($PID) so two near-simultaneous spawns don't contend
+                # for one compile.log; capture stderr too; -NoProfile to match the other spawns.
+                $tag    = "$((Get-Date).ToString('yyyyMMdd-HHmmss'))-$PID"
+                $outLog = Join-Path $CLAUDE_DIR "compile-$tag.out.log"
+                $errLog = Join-Path $CLAUDE_DIR "compile-$tag.err.log"
                 Start-Process -FilePath "pwsh" `
-                    -ArgumentList @("-NonInteractive", "-File", "`"$compilePs`"", "-Log", "`"$logPath`"") `
+                    -ArgumentList @("-NoProfile", "-NonInteractive", "-File", "`"$compilePs`"", "-Log", "`"$logPath`"") `
                     -WindowStyle Hidden `
-                    -RedirectStandardOutput (Join-Path $CLAUDE_DIR "compile.log")
+                    -RedirectStandardOutput $outLog `
+                    -RedirectStandardError $errLog
             }
             catch {
                 Write-FlushLog "ERROR" "Failed to spawn compile.ps1: $_"

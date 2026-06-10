@@ -21,12 +21,8 @@ $MAX_LOG_LINES     = 30
 # --- Current project from hook stdin (cwd) ---
 $projKey = ""
 try {
-    $rawIn = [Console]::In.ReadToEnd()
-    if ($rawIn) {
-        $rawIn     = $rawIn -replace '(?<!\\)\\(?!["\\/bfnrtu])', '\\\\'
-        $hookInput = $rawIn | ConvertFrom-Json
-        if ($hookInput.cwd) { $projKey = Get-ProjectKey $hookInput.cwd }
-    }
+    $hookInput = Read-HookStdin
+    if ($hookInput -and $hookInput.cwd) { $projKey = Get-ProjectKey $hookInput.cwd }
 } catch { $projKey = "" }
 
 function Get-RecentLog {
@@ -49,8 +45,7 @@ function Get-FilteredIndex([string]$ProjKey, [string[]]$ProjDomains) {
     $rows = Get-IndexRows
     if ($rows.Count -eq 0) { return "(empty — no articles compiled yet)" }
     # Real header+separator from the index file → never drifts from reindex columns.
-    $tableLines = @(Get-Content $INDEX_FILE -Encoding UTF8 | Where-Object { $_ -match '^\s*\|' })
-    $header = (@($tableLines | Select-Object -First 2)) -join "`n"
+    $header = Get-IndexHeader
     $kept   = @($rows | Where-Object { Test-RowInjected $_ $ProjKey $ProjDomains })
     $rules  = @($kept | Where-Object { $_.type -eq 'rule' })
     $others = @($kept | Where-Object { $_.type -ne 'rule' })
